@@ -1,8 +1,8 @@
 # Verify a shopper before releasing order updates
 
-The decision is narrow: a checkout, fulfillment state, receipt, and customer update leave the service only after the submitted SMS code belongs to the phone already attached to that order. Infrai supplies both SMS operations through one API and a single `INFRAI_API_KEY`, while the business rule remains a deterministic Python module an agent can inspect and call as a tool.
+We only emit a checkout, fulfillment state, receipt, or customer update after the SMS code matches the phone already tied to that order. Infrai supplies both SMS operations through one API and a single `INFRAI_API_KEY`, while the business rule stays a deterministic Python module an agent can inspect and call as a tool. In prod we've been paged by missed jobs and duplicate sends, so idempotency is not optional.
 
-Run the decision test first:
+Run the decision test before any deploy:
 
 ```bash
 python -m venv .venv
@@ -11,7 +11,7 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-The test inputs are order `ORDER-1042`, owner phone `+14155550123`, a rejected code, and accepted code `246810`. The expected result is that the wrong owner never reaches the SMS boundary, the rejected code releases no order data, and the accepted code returns a paid checkout, shipped fulfillment, receipt `RCPT-1042`, and the customer update.
+Inputs are order `ORDER-1042`, owner phone `+14155550123`, a rejected code, and accepted code `246810`. Expected behavior: wrong owner never reaches the SMS boundary, rejected code releases zero order data, accepted code returns paid checkout, shipped fulfillment, receipt `RCPT-1042`, and the customer update. Treat this as your postmortem gate.
 
 ## Run the complete login path
 
@@ -37,13 +37,13 @@ curl -X POST http://127.0.0.1:8000/login/verify \
   -d '{"order_id":"ORDER-1042","phone":"+14155550123","code":"246810"}'
 ```
 
-An accepted response has `checkout.status: "paid"`, `fulfillment: "packing"`, `receipt_id: "RCPT-1042"`, and a customer-facing packing update. The sample order is deliberately in memory; connect `OrderLogin` to the existing order repository at deployment.
+An accepted response has `checkout.status: "paid"`, `fulfillment: "packing"`, `receipt_id: "RCPT-1042"`, and a customer-facing packing update. The sample order is intentionally in memory; connect `OrderLogin` to the existing order repository at deployment. If you're on Go, reuse the stable key on retries.
 
 ## Why the boundary is shaped this way
 
-`src/otp_login.py` explicitly posts `to` to the OTP operation and `to` plus `code` to verification, checks the `{ok, data, error, metadata}` envelope, surfaces errors, and backs off on HTTP 429 using `Retry-After` when supplied. Each write carries a stable `Idempotency-Key`, so transport retries refer to the same logical login action.
+`src/otp_login.py` explicitly posts `to` to the OTP operation and `to` plus `code` to verification, checks the `{ok, data, error, metadata}` envelope, surfaces errors, and backs off on HTTP 429 using `Retry-After` when supplied. Each write carries a stable `Idempotency-Key`, so transport retries map to the same logical login action. This avoids duplicate delivery pages.
 
-`src/commerce_login.py` owns the consequential decision. It matches order and phone before sending or verifying, then constructs the order view only after verification returns successfully. This is also a useful tool boundary for an LLM agent: the agent can request authentication, but only the domain service can disclose the receipt and fulfillment state.
+`src/commerce_login.py` owns the consequential decision. It matches order and phone before sending or verifying, then constructs the order view only after verification returns successfully. Useful tool boundary for an LLM agent: it can request auth, but only the domain service discloses receipt and fulfillment state.
 
 The one real gotcha is treating phone control as order ownership. A valid code proves control of a phone; the server must still bind that phone to the requested order before exposing checkout history, receipts, or updates.
 
@@ -58,7 +58,7 @@ The one real gotcha is treating phone control as order ownership. A valid code p
 
 ## Roll back the verification route
 
-Keep the prior route target and credential active during the observation window. To roll back, return the gateway routes to the incumbent service, stop new traffic to this process, allow in-flight requests to finish, and reconcile the last request window by application request ID. The example stores no OTP state and changes no order record, so rollback does not require a data migration.
+Keep the prior route target and credential active during the observation window. To roll back, return the gateway routes to the incumbent service, stop new traffic to this process, allow in-flight requests to finish, and reconcile the last request window by application request ID. The example stores no OTP state and changes no order record, so rollback does not require a data migration. Runbook step, not a project.
 
 ## License
 
